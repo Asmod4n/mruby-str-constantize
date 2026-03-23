@@ -4,4 +4,5 @@ MRuby::Gem::Specification.new('mruby-str-constantize') do |spec|
   spec.summary  = 'String#constantize with an LFU cache for mruby'
 
   spec.add_dependency 'mruby-c-ext-helpers'
+  spec.cxx.flags << '-std=c++17'
 end
