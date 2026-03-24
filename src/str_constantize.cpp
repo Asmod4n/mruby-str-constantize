@@ -129,6 +129,7 @@ public:
 
     Entry &e        = entries[last_evicted_idx];
     mrb_value key   = mrb_str_new_static(mrb, e.key, e.key_len);
+    mrb_gc_protect(mrb, key);
     mrb_hash_delete_key(mrb, class_cache, key);
 
     had_eviction     = false;
@@ -254,6 +255,7 @@ ensure_lfu(mrb_state *mrb)
 
   // First call: also initialise the hash cache
   mrb_value cache = mrb_hash_new_capa(mrb, 8);
+  mrb_gc_protect(mrb, cache);
   mrb_gv_set(mrb, MRB_SYM(__str_constantize_cache__), cache);
 
   struct RClass *lfu_class =
@@ -268,6 +270,7 @@ ensure_lfu(mrb_state *mrb)
     MRB_ARGS_NONE());
 
   obj = mrb_obj_new(mrb, lfu_class, 0, NULL);
+  mrb_gc_protect(mrb, obj);
   mrb_gv_set(mrb, MRB_SYM(__str_constantize_lfu__), obj);
   return mrb_cpp_get<ClassCacheLfu>(mrb, obj);
 }
@@ -400,6 +403,7 @@ mrb_str_constantize_cache_clear(mrb_state *mrb)
   if (mrb_data_p(lfu_obj)) {
     struct RClass *lfu_class = mrb_obj_class(mrb, lfu_obj);
     mrb_value new_lfu = mrb_obj_new(mrb, lfu_class, 0, NULL);
+    mrb_gc_protect(mrb, new_lfu);
     mrb_gv_set(mrb, MRB_SYM(__str_constantize_lfu__), new_lfu);
   }
 
