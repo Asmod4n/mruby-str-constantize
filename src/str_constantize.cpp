@@ -377,8 +377,8 @@ mrb_str_constantize(mrb_state *mrb, mrb_value str)
   const char *ptr = RSTRING_PTR(str);
   mrb_int     len = RSTRING_LEN(str);
 
-  mrb_value   cache = mrb_gv_get(mrb, MRB_SYM(__str_constantize_cache__));
   ClassCacheLfu *lfu = ensure_lfu(mrb);
+  mrb_value   cache = mrb_gv_get(mrb, MRB_SYM(__str_constantize_cache__));
 
   // Fast path: hash cache hit
   mrb_value cached = mrb_hash_get(mrb, cache, str);
