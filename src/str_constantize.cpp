@@ -15,6 +15,7 @@
 #include <vector>
 #include <limits>
 #include <cstdint>
+#include <ctime>
 
 // ============================================================================
 // LFU cache
@@ -58,7 +59,18 @@ public:
   uint16_t last_evicted_idx = NIL;
   bool     had_eviction     = false;
 
-  ClassCacheLfu()  = default;
+  /* Per-instance seed for hash-flooding resistance. Mixed into FNV-1a's
+   * basis so an attacker cannot precompute a colliding set of class
+   * names across process boundaries. Not crypto-strong; not meant to be. */
+  uint32_t seed = 0;
+
+  ClassCacheLfu()
+  {
+    seed = (uint32_t)std::time(nullptr)
+         ^ (uint32_t)(uintptr_t)this
+         ^ 0x9e3779b9u;
+    if (seed == 0) seed = 0xa5a5a5a5u;
+  }
   ~ClassCacheLfu() = default;
 
   void touch(uint16_t idx)
@@ -129,7 +141,6 @@ public:
 
     Entry &e        = entries[last_evicted_idx];
     mrb_value key   = mrb_str_new_static(mrb, e.key, e.key_len);
-    mrb_gc_protect(mrb, key);
     mrb_hash_delete_key(mrb, class_cache, key);
 
     had_eviction     = false;
@@ -137,9 +148,9 @@ public:
   }
 
 private:
-  static uint32_t hash(const char *p, uint16_t len)
+  uint32_t hash(const char *p, uint16_t len) const
   {
-    uint32_t h = 2166136261u;
+    uint32_t h = 2166136261u ^ seed;
     for (uint16_t i = 0; i < len; ++i) {
       h ^= static_cast<unsigned char>(p[i]);
       h *= 16777619u;
@@ -151,41 +162,63 @@ private:
   {
     uint32_t h    = hash(e.key, e.key_len);
     uint16_t mask = INDEX_CAP - 1;
-    int      attempts = 0;
 
-    for (;;) {
-      for (uint16_t i = 0; i < INDEX_CAP; ++i) {
-        uint16_t slot = (h + i) & mask;
-        Slot &s = index[slot];
-
-        if (!s.used || (s.hash == h && s.idx == idx)) {
-          s.used = true;
-          s.hash = h;
-          s.idx  = idx;
-          return;
-        }
-      }
-
-      uint16_t victim = evict_one();
-      if (victim == NIL || ++attempts > 4) {
-        mrb_assert(false && "can't find free slot");
-        return;
-      }
-    }
-  }
-
-  void index_erase(const Entry &e)
-  {
-    uint32_t h    = hash(e.key, e.key_len);
-    uint16_t mask = INDEX_CAP - 1;
-
+    /* MAX_SIZE (128) < INDEX_CAP (256): a free slot must exist. */
     for (uint16_t i = 0; i < INDEX_CAP; ++i) {
       uint16_t slot = (h + i) & mask;
       Slot &s = index[slot];
 
+      if (!s.used || (s.hash == h && s.idx == idx)) {
+        s.used = true;
+        s.hash = h;
+        s.idx  = idx;
+        return;
+      }
+    }
+    mrb_assert(false && "index_set: probe chain exhausted");
+  }
+
+  void index_erase(const Entry &e)
+  {
+    uint32_t h_target           = hash(e.key, e.key_len);
+    uint16_t mask               = INDEX_CAP - 1;
+    uint16_t target_idx_entries = (uint16_t)(&e - entries);
+    uint16_t empty_slot         = NIL;
+
+    /* Locate the slot. */
+    for (uint16_t i = 0; i < INDEX_CAP; ++i) {
+      uint16_t slot = (h_target + i) & mask;
+      Slot &s = index[slot];
       if (!s.used) return;
-      if (s.hash == h && s.idx == (&e - entries)) {
-        s.used = false;
+      if (s.hash == h_target && s.idx == target_idx_entries) {
+        s.used     = false;
+        empty_slot = slot;
+        break;
+      }
+    }
+    if (empty_slot == NIL) return;
+
+    /* Backshift compaction. While the slot after empty is occupied and
+     * the entry there could legally live in empty_slot (its natural
+     * position is at-or-before empty on the probe path), move it.
+     * Preserves the invariant that every entry is reachable from its
+     * natural slot without crossing an unused slot. Without this,
+     * find() would short-circuit at the erased slot and miss entries
+     * that collided past it. */
+    for (uint16_t i = 0; i < INDEX_CAP; ++i) {
+      uint16_t next_slot = (uint16_t)((empty_slot + 1) & mask);
+      Slot &next = index[next_slot];
+      if (!next.used) return;
+
+      uint16_t natural = (uint16_t)(next.hash & mask);
+      uint16_t d_empty = (uint16_t)((empty_slot - natural) & mask);
+      uint16_t d_next  = (uint16_t)((next_slot  - natural) & mask);
+
+      if (d_empty <= d_next) {
+        index[empty_slot] = next;
+        next.used  = false;
+        empty_slot = next_slot;
+      } else {
         return;
       }
     }
@@ -255,7 +288,6 @@ ensure_lfu(mrb_state *mrb)
 
   // First call: also initialise the hash cache
   mrb_value cache = mrb_hash_new_capa(mrb, 8);
-  mrb_gc_protect(mrb, cache);
   mrb_gv_set(mrb, MRB_SYM(__str_constantize_cache__), cache);
 
   struct RClass *lfu_class =
@@ -270,7 +302,6 @@ ensure_lfu(mrb_state *mrb)
     MRB_ARGS_NONE());
 
   obj = mrb_obj_new(mrb, lfu_class, 0, NULL);
-  mrb_gc_protect(mrb, obj);
   mrb_gv_set(mrb, MRB_SYM(__str_constantize_lfu__), obj);
   return mrb_cpp_get<ClassCacheLfu>(mrb, obj);
 }
@@ -320,9 +351,13 @@ do_constantize(mrb_state *mrb, mrb_value str,
 
   for (size_t i = 0; i < segments.size(); ++i) {
     string_view seg = segments[i];
-    mrb_sym sym = mrb_intern(mrb, seg.data(), (mrb_int)seg.size());
+    /* mrb_intern_check: returns 0 if the symbol was never interned. Since
+     * any defined constant must have an interned name in the symbol table,
+     * sym == 0 proves the constant cannot exist. Failing here avoids
+     * leaking attacker-controlled bytes into the (monotonic) symbol table. */
+    mrb_sym sym = mrb_intern_check(mrb, seg.data(), (mrb_int)seg.size());
 
-    if (unlikely(!mrb_const_defined_at(mrb, current, sym)))
+    if (unlikely(sym == 0 || !mrb_const_defined_at(mrb, current, sym)))
       mrb_raisef(mrb, E_NAME_ERROR, "uninitialized constant %v", str);
 
     mrb_value cnst = mrb_const_get(mrb, current, sym);
@@ -403,7 +438,6 @@ mrb_str_constantize_cache_clear(mrb_state *mrb)
   if (mrb_data_p(lfu_obj)) {
     struct RClass *lfu_class = mrb_obj_class(mrb, lfu_obj);
     mrb_value new_lfu = mrb_obj_new(mrb, lfu_class, 0, NULL);
-    mrb_gc_protect(mrb, new_lfu);
     mrb_gv_set(mrb, MRB_SYM(__str_constantize_lfu__), new_lfu);
   }
 
